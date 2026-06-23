@@ -30,9 +30,10 @@
     },
     "extra": {
       "eas": {
-        "projectId": "072cdf47-4fdc-415b-a6b5-2f15f43d54e6"
+        "projectId": "24730d7f-d6f1-4912-a39e-626fb1787c5c"
       }
     },
-    "newArchEnabled": false
+    "newArchEnabled": false,
+    "owner": "katiya"
   }
 }

@@ -163,23 +163,43 @@ export default function App() {
   // ── Data & playback logic (unchanged) ─────────────────────────────
   const loadTrendingCharts = async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/api/popular`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const response = await fetch(`${BACKEND_URL}/api/popular`, { signal: controller.signal });
+      clearTimeout(timeoutId);
       const data = await response.json();
-      if (data.tracks) setTrendingTracks(data.tracks);
-    } catch (err) { console.log("Failed loading dashboard popular chart items:", err); }
+      if (response.ok && data.tracks && Array.isArray(data.tracks)) {
+        setTrendingTracks(data.tracks);
+      } else {
+        console.log("Failed loading trending:", data.detail || response.statusText);
+      }
+    } catch (err: any) { 
+      if (err.name !== 'AbortError') {
+        console.log("Failed loading dashboard popular chart items:", err);
+      }
+    }
   };
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
     setIsSearchLoading(true);
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
       const response = await fetch(
         `${BACKEND_URL}/api/search/instant?q=${encodeURIComponent(searchQuery)}`,
+        { signal: controller.signal }
       );
+      clearTimeout(timeoutId);
       const data = await response.json();
-      if (!response.ok || (!data.tracks && !data.track)) { alert("No tracks found matching your entry."); return; }
-      setSearchResults(data.tracks ? data.tracks : [data.track]);
-    } catch (error) { console.error("Connection link issues:", error); }
+      if (!response.ok) { alert(`Search failed: ${data.detail || response.statusText}`); return; }
+      if (!data.tracks || !Array.isArray(data.tracks)) { alert("No tracks found matching your entry."); return; }
+      if (data.tracks.length === 0) { alert("No tracks found matching your entry."); return; }
+      setSearchResults(data.tracks);
+    } catch (error: any) { 
+      if (error.name === 'AbortError') { alert("Search timed out. Try again."); }
+      else { console.error("Search error:", error); alert("Connection error. Please try again."); }
+    }
     finally { setIsSearchLoading(false); }
   };
 
@@ -197,15 +217,21 @@ export default function App() {
       await TrackPlayer.add({ id: track.id, url: activeStreamUrl ?? "", title: track.title, artist: track.artist, artwork: track.art, duration: track.durationSec } as any);
       setCurrentTrack(track);
       await TrackPlayer.play();
-      fetch(`${BACKEND_URL}/api/search/queue?video_id=${track.id}`)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      fetch(`${BACKEND_URL}/api/search/queue?video_id=${track.id}`, { signal: controller.signal })
         .then(r => r.json())
         .then(async queueData => {
-          if (queueData.tracks) {
+          clearTimeout(timeoutId);
+          if (queueData.tracks && Array.isArray(queueData.tracks)) {
             setQueueTracks(queueData.tracks);
             await TrackPlayer.add(queueData.tracks.map((t: Track) => ({ id: t.id, url: t.streamUrl ?? "", title: t.title, artist: t.artist, artwork: t.art, duration: t.durationSec })) as any);
           }
         })
-        .catch(err => console.log("Contextual background queueing failed:", err));
+        .catch(err => {
+          clearTimeout(timeoutId);
+          console.log("Contextual background queueing failed:", err);
+        });
     } catch (err) { console.error("Playback execution failed:", err); }
     finally { setIsTrackLoading(false); }
   };
