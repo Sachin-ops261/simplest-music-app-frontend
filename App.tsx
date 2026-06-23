@@ -57,15 +57,15 @@ export default function App() {
   const playbackState = usePlaybackState();
   const progress = useProgress();
 
-  // 🔄 UI/UX & Structural States
-  const [trendingTracks, setTrendingTracks] = useState<Track[]>([]); // 📈 Trending Dashboard Cache
+  const [trendingTracks, setTrendingTracks] = useState<Track[]>([]);
   const [searchResults, setSearchResults] = useState<Track[]>([]);
   const [queueTracks, setQueueTracks] = useState<Track[]>([]);
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isTrackLoading, setIsTrackLoading] = useState<boolean>(false); // ← for track play loading
+  const [isSearchLoading, setIsSearchLoading] = useState<boolean>(false); // ← for search loading
   const [isShuffleEnabled, setIsShuffleEnabled] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
-  const [isSearchFocused, setIsSearchFocused] = useState<boolean>(false); // 🔍 Focus layout switch
+  const [isSearchFocused, setIsSearchFocused] = useState<boolean>(false);
   const [likedSongs, setLikedSongs] = useState<string[]>([]);
   const [isPlayerModalOpen, setIsPlayerModalOpen] = useState<boolean>(false);
   const [isQueueVisible, setIsQueueVisible] = useState<boolean>(false);
@@ -95,10 +95,10 @@ export default function App() {
       }
     }
     setupPlayer();
-    loadTrendingCharts(); // 🔥 Initialize Dashboard Landing Page Data Fetch
-  }, []); // ← empty array: runs once on mount only
+    loadTrendingCharts();
+  }, []);
 
-  // Remote control listeners — re-register when queue/track/shuffle changes
+  // Remote control listeners
   useEffect(() => {
     const playListener = TrackPlayer.addEventListener(Event.RemotePlay, () =>
       TrackPlayer.play(),
@@ -122,7 +122,7 @@ export default function App() {
     };
   }, [queueTracks, currentTrack, isShuffleEnabled]);
 
-  // Synchronize internal tracking states on native queue engine events
+  // Sync track state on native queue changes
   useEffect(() => {
     const trackChangedListener = TrackPlayer.addEventListener(
       Event.PlaybackActiveTrackChanged,
@@ -143,7 +143,6 @@ export default function App() {
     return () => trackChangedListener.remove();
   }, []);
 
-  // 📈 Loads popular global internet hits for the home dashboard view
   const loadTrendingCharts = async () => {
     try {
       const response = await fetch(`${BACKEND_URL}/api/popular`);
@@ -154,10 +153,9 @@ export default function App() {
     }
   };
 
-  // 🔍 YouTube-Style Metadata Aggregator
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
-    setIsLoading(true);
+    setIsSearchLoading(true); // ← uses separate search loading state
     try {
       const response = await fetch(
         `${BACKEND_URL}/api/search/instant?q=${encodeURIComponent(searchQuery)}`,
@@ -166,7 +164,6 @@ export default function App() {
 
       if (!response.ok || (!data.tracks && !data.track)) {
         alert("No tracks found matching your entry.");
-        setIsLoading(false);
         return;
       }
       const results = data.tracks ? data.tracks : [data.track];
@@ -174,17 +171,16 @@ export default function App() {
     } catch (error) {
       console.error("Connection link issues:", error);
     } finally {
-      setIsLoading(false);
+      setIsSearchLoading(false);
     }
   };
 
-  // 🎵 Resolves selected audio streams & handles contextual queueing
   const playSingleTrack = async (track: Track) => {
-    setIsLoading(true);
+    setIsTrackLoading(true); // ← uses separate track loading state
     try {
       let activeStreamUrl = track.streamUrl;
 
-      // Resolve real audio links on-demand
+      // Always resolve if no stream URL or it's a YouTube watch URL
       if (!activeStreamUrl || activeStreamUrl.includes("youtube.com/watch")) {
         const res = await fetch(
           `${BACKEND_URL}/api/tracks/resolve?video_id=${track.id}`,
@@ -195,13 +191,12 @@ export default function App() {
           track.streamUrl = data.streamUrl;
         } else {
           alert("Could not resolve streaming link for this track.");
-          setIsLoading(false);
+          setIsTrackLoading(false);
           return;
         }
       }
 
       await TrackPlayer.reset();
-      // 🛡️ Fixes TS2769 strict parameter overload exceptions via explicit interface casting
       await TrackPlayer.add({
         id: track.id,
         url: activeStreamUrl ?? "",
@@ -214,7 +209,7 @@ export default function App() {
       setCurrentTrack(track);
       await TrackPlayer.play();
 
-      // Fetch automated matching recommendations for queue background generation
+      // Background queue fetch
       fetch(`${BACKEND_URL}/api/search/queue?video_id=${track.id}`)
         .then((res) => res.json())
         .then(async (queueData) => {
@@ -237,7 +232,7 @@ export default function App() {
     } catch (err) {
       console.error("Playback execution failed:", err);
     } finally {
-      setIsLoading(false);
+      setIsTrackLoading(false);
     }
   };
 
@@ -257,11 +252,7 @@ export default function App() {
     if (currentIndex === -1) return;
 
     let nextIndex = direction === "next" ? currentIndex + 1 : currentIndex - 1;
-    if (
-      isShuffleEnabled &&
-      direction === "next" &&
-      fullCurrentPlaylist.length > 1
-    ) {
+    if (isShuffleEnabled && direction === "next" && fullCurrentPlaylist.length > 1) {
       let randomIndex = currentIndex;
       while (randomIndex === currentIndex) {
         randomIndex = Math.floor(Math.random() * fullCurrentPlaylist.length);
@@ -281,7 +272,6 @@ export default function App() {
     );
   };
 
-  // Exit Search State clean helper
   const cancelSearchFocus = () => {
     setIsSearchFocused(false);
     setSearchQuery("");
@@ -322,13 +312,21 @@ export default function App() {
             onFocus={() => setIsSearchFocused(true)}
             onSubmitEditing={handleSearch}
             returnKeyType="search"
+            editable={!isSearchLoading}
           />
         </View>
       </View>
 
+      {/* TRACK LOADING OVERLAY — only shows when resolving audio, doesn't block search */}
+      {isTrackLoading && (
+        <View style={styles.trackLoadingBar}>
+          <ActivityIndicator size="small" color="#1DB954" />
+          <Text style={styles.trackLoadingText}>Loading track...</Text>
+        </View>
+      )}
+
       {/* CORE DISPLAY WINDOW VIEW SWITCH */}
       {!isSearchFocused ? (
-        /* 🏠 HOME DASHBOARD VIEW (Default Startup Layout) */
         <ScrollView
           contentContainerStyle={styles.mainContainer}
           showsVerticalScrollIndicator={false}
@@ -357,10 +355,7 @@ export default function App() {
                 <Image source={{ uri: song.art }} style={styles.songArtThumb} />
                 <View style={{ flex: 1, marginLeft: 12 }}>
                   <Text
-                    style={[
-                      styles.songTitleText,
-                      isCurrent && { color: "#1DB954" },
-                    ]}
+                    style={[styles.songTitleText, isCurrent && { color: "#1DB954" }]}
                     numberOfLines={1}
                   >
                     {song.title}
@@ -379,12 +374,11 @@ export default function App() {
           })}
         </ScrollView>
       ) : (
-        /* 🔍 INTENT FOCUS PANEL (Pure Black Area for Query Handling) */
         <ScrollView
           contentContainerStyle={styles.mainContainer}
           style={styles.blackFocusContainer}
         >
-          {isLoading ? (
+          {isSearchLoading ? (
             <ActivityIndicator
               size="large"
               color="#1DB954"
@@ -406,16 +400,10 @@ export default function App() {
                   style={styles.songCard}
                   onPress={() => playSingleTrack(song)}
                 >
-                  <Image
-                    source={{ uri: song.art }}
-                    style={styles.songArtThumb}
-                  />
+                  <Image source={{ uri: song.art }} style={styles.songArtThumb} />
                   <View style={{ flex: 1, marginLeft: 12 }}>
                     <Text
-                      style={[
-                        styles.songTitleText,
-                        isCurrent && { color: "#1DB954" },
-                      ]}
+                      style={[styles.songTitleText, isCurrent && { color: "#1DB954" }]}
                       numberOfLines={1}
                     >
                       {song.title}
@@ -440,46 +428,29 @@ export default function App() {
       {currentTrack && (
         <Pressable
           style={styles.miniPlayer}
-          onPress={() => {
-            setIsPlayerModalOpen(true);
-            setIsQueueVisible(false);
-          }}
+          onPress={() => { setIsPlayerModalOpen(true); setIsQueueVisible(false); }}
         >
           <Image source={{ uri: currentTrack.art }} style={styles.miniArt} />
           <View style={{ flex: 1, marginLeft: 10, marginRight: 8 }}>
-            <Text style={styles.miniTitle} numberOfLines={1}>
-              {currentTrack.title}
-            </Text>
-            <Text style={styles.miniArtist} numberOfLines={1}>
-              {currentTrack.artist}
-            </Text>
+            <Text style={styles.miniTitle} numberOfLines={1}>{currentTrack.title}</Text>
+            <Text style={styles.miniArtist} numberOfLines={1}>{currentTrack.artist}</Text>
           </View>
 
           <View style={styles.miniControlsRow}>
-            <Pressable
-              onPress={() => handleSkip("prev")}
-              style={styles.miniControlBtn}
-            >
+            <Pressable onPress={() => handleSkip("prev")} style={styles.miniControlBtn}>
               <SkipBack size={18} color="#fff" />
             </Pressable>
             <Pressable onPress={togglePlayPause} style={styles.miniControlBtn}>
-              {isPlaying ? (
-                <Pause size={20} color="#fff" />
-              ) : (
-                <Play size={20} color="#fff" />
-              )}
+              {isPlaying ? <Pause size={20} color="#fff" /> : <Play size={20} color="#fff" />}
             </Pressable>
-            <Pressable
-              onPress={() => handleSkip("next")}
-              style={styles.miniControlBtn}
-            >
+            <Pressable onPress={() => handleSkip("next")} style={styles.miniControlBtn}>
               <SkipForward size={18} color="#fff" />
             </Pressable>
           </View>
         </Pressable>
       )}
 
-      {/* DETAILED PLAYER EXPANSION CORE DOCK */}
+      {/* DETAILED PLAYER MODAL */}
       <Modal
         visible={isPlayerModalOpen}
         animationType="slide"
@@ -488,21 +459,12 @@ export default function App() {
       >
         <View style={styles.modalContainer}>
           <View style={styles.modalHeaderRow}>
-            <Pressable
-              style={styles.closeButton}
-              onPress={() => setIsPlayerModalOpen(false)}
-            >
+            <Pressable style={styles.closeButton} onPress={() => setIsPlayerModalOpen(false)}>
               <ChevronDown size={28} color="#fff" />
             </Pressable>
             <Text style={styles.modalNowPlayingTitle}>Now Playing</Text>
-            <Pressable
-              style={styles.closeButton}
-              onPress={() => setIsQueueVisible(!isQueueVisible)}
-            >
-              <ListMusic
-                size={24}
-                color={isQueueVisible ? "#1DB954" : "#fff"}
-              />
+            <Pressable style={styles.closeButton} onPress={() => setIsQueueVisible(!isQueueVisible)}>
+              <ListMusic size={24} color={isQueueVisible ? "#1DB954" : "#fff"} />
             </Pressable>
           </View>
 
@@ -510,47 +472,24 @@ export default function App() {
             <View style={styles.modalContent}>
               {!isQueueVisible ? (
                 <View style={styles.classicPlayerView}>
-                  <Image
-                    source={{ uri: currentTrack.art }}
-                    style={styles.bigArt}
-                  />
-                  <Text style={styles.bigTitle} numberOfLines={1}>
-                    {currentTrack.title}
-                  </Text>
-                  <Text style={styles.bigArtist} numberOfLines={1}>
-                    {currentTrack.artist}
-                  </Text>
+                  <Image source={{ uri: currentTrack.art }} style={styles.bigArt} />
+                  <Text style={styles.bigTitle} numberOfLines={1}>{currentTrack.title}</Text>
+                  <Text style={styles.bigArtist} numberOfLines={1}>{currentTrack.artist}</Text>
                 </View>
               ) : (
                 <View style={styles.queueContainerView}>
                   <Text style={styles.queueHeaderLabel}>Up Next</Text>
-                  <ScrollView
-                    style={styles.queueScrollView}
-                    showsVerticalScrollIndicator={false}
-                  >
+                  <ScrollView style={styles.queueScrollView} showsVerticalScrollIndicator={false}>
                     {queueTracks.map((qSong, qIdx) => (
                       <Pressable
                         key={`queue-${qSong.id}-${qIdx}`}
                         style={styles.queueCard}
                         onPress={() => playSingleTrack(qSong)}
                       >
-                        <Image
-                          source={{ uri: qSong.art }}
-                          style={styles.queueThumb}
-                        />
+                        <Image source={{ uri: qSong.art }} style={styles.queueThumb} />
                         <View style={{ flex: 1, marginLeft: 12 }}>
-                          <Text
-                            style={styles.queueTrackTitle}
-                            numberOfLines={1}
-                          >
-                            {qSong.title}
-                          </Text>
-                          <Text
-                            style={styles.queueTrackArtist}
-                            numberOfLines={1}
-                          >
-                            {qSong.artist}
-                          </Text>
+                          <Text style={styles.queueTrackTitle} numberOfLines={1}>{qSong.title}</Text>
+                          <Text style={styles.queueTrackArtist} numberOfLines={1}>{qSong.artist}</Text>
                         </View>
                         <Play size={14} color="#666" />
                       </Pressable>
@@ -565,19 +504,13 @@ export default function App() {
                     <View
                       style={[
                         styles.progressBarFill,
-                        {
-                          width: `${(progress.position / (currentTrack.durationSec || 1)) * 100}%`,
-                        },
+                        { width: `${(progress.position / (currentTrack.durationSec || 1)) * 100}%` },
                       ]}
                     />
                   </View>
                   <View style={styles.timeRow}>
-                    <Text style={styles.timeText}>
-                      {formatTime(progress.position)}
-                    </Text>
-                    <Text style={styles.timeText}>
-                      {formatTime(currentTrack.durationSec)}
-                    </Text>
+                    <Text style={styles.timeText}>{formatTime(progress.position)}</Text>
+                    <Text style={styles.timeText}>{formatTime(currentTrack.durationSec)}</Text>
                   </View>
                 </View>
 
@@ -585,16 +518,8 @@ export default function App() {
                   <Pressable onPress={() => toggleLike(currentTrack.id)}>
                     <Heart
                       size={24}
-                      color={
-                        likedSongs.includes(currentTrack.id)
-                          ? "#1DB954"
-                          : "#fff"
-                      }
-                      fill={
-                        likedSongs.includes(currentTrack.id)
-                          ? "#1DB954"
-                          : "transparent"
-                      }
+                      color={likedSongs.includes(currentTrack.id) ? "#1DB954" : "#fff"}
+                      fill={likedSongs.includes(currentTrack.id) ? "#1DB954" : "transparent"}
                     />
                   </Pressable>
 
@@ -602,28 +527,16 @@ export default function App() {
                     <SkipBack size={32} color="#fff" />
                   </Pressable>
 
-                  <Pressable
-                    style={styles.playButtonBig}
-                    onPress={togglePlayPause}
-                  >
-                    {isPlaying ? (
-                      <Pause size={32} color="#000" />
-                    ) : (
-                      <Play size={32} color="#000" />
-                    )}
+                  <Pressable style={styles.playButtonBig} onPress={togglePlayPause}>
+                    {isPlaying ? <Pause size={32} color="#000" /> : <Play size={32} color="#000" />}
                   </Pressable>
 
                   <Pressable onPress={() => handleSkip("next")}>
                     <SkipForward size={32} color="#fff" />
                   </Pressable>
 
-                  <Pressable
-                    onPress={() => setIsShuffleEnabled(!isShuffleEnabled)}
-                  >
-                    <Shuffle
-                      size={24}
-                      color={isShuffleEnabled ? "#1DB954" : "#fff"}
-                    />
+                  <Pressable onPress={() => setIsShuffleEnabled(!isShuffleEnabled)}>
+                    <Shuffle size={24} color={isShuffleEnabled ? "#1DB954" : "#fff"} />
                   </Pressable>
                 </View>
 
@@ -637,9 +550,7 @@ export default function App() {
                     <ChevronUp size={24} color="#aaa" />
                   )}
                   <Text style={styles.queueToggleActionText}>
-                    {isQueueVisible
-                      ? "Hide Queue"
-                      : "Swipe / Click to See Queue"}
+                    {isQueueVisible ? "Hide Queue" : "Swipe / Click to See Queue"}
                   </Text>
                 </Pressable>
               </View>
@@ -661,18 +572,8 @@ const styles = StyleSheet.create({
     borderBottomColor: "#161616",
     paddingBottom: 12,
   },
-  headerContainerFocused: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingTop: 56,
-  },
-  brandTitle: {
-    color: "#fff",
-    fontSize: 24,
-    fontWeight: "bold",
-    marginBottom: 14,
-    letterSpacing: 0.5,
-  },
+  headerContainerFocused: { flexDirection: "row", alignItems: "center", paddingTop: 56 },
+  brandTitle: { color: "#fff", fontSize: 24, fontWeight: "bold", marginBottom: 14, letterSpacing: 0.5 },
   backArrowButton: { paddingRight: 12, paddingVertical: 8 },
   searchBarRow: {
     flexDirection: "row",
@@ -686,13 +587,19 @@ const styles = StyleSheet.create({
   searchBarRowFull: { flex: 1 },
   searchInput: { flex: 1, color: "#fff", fontSize: 14, paddingVertical: 0 },
 
-  mainContainer: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 110 },
-  blackFocusContainer: { backgroundColor: "#000000", flex: 1 },
-  sectionHeaderRow: {
+  trackLoadingBar: {
     flexDirection: "row",
     alignItems: "center",
-    marginBottom: 16,
+    justifyContent: "center",
+    backgroundColor: "#1a1a1a",
+    paddingVertical: 6,
+    gap: 8,
   },
+  trackLoadingText: { color: "#1DB954", fontSize: 12 },
+
+  mainContainer: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 110 },
+  blackFocusContainer: { backgroundColor: "#000000", flex: 1 },
+  sectionHeaderRow: { flexDirection: "row", alignItems: "center", marginBottom: 16 },
   sectionHeader: { color: "#fff", fontSize: 18, fontWeight: "bold" },
 
   emptySearchCenterBlock: {
@@ -702,12 +609,7 @@ const styles = StyleSheet.create({
     marginTop: 100,
     paddingHorizontal: 40,
   },
-  emptySearchText: {
-    color: "#444",
-    fontSize: 13,
-    textAlign: "center",
-    lineHeight: 18,
-  },
+  emptySearchText: { color: "#444", fontSize: 13, textAlign: "center", lineHeight: 18 },
 
   songCard: {
     flexDirection: "row",
@@ -717,12 +619,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginBottom: 10,
   },
-  songArtThumb: {
-    width: 48,
-    height: 48,
-    borderRadius: 4,
-    backgroundColor: "#222",
-  },
+  songArtThumb: { width: 48, height: 48, borderRadius: 4, backgroundColor: "#222" },
   songTitleText: { color: "#fff", fontSize: 15, fontWeight: "500" },
   songArtistText: { color: "#888", fontSize: 13, marginTop: 2 },
 
@@ -772,42 +669,13 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
 
-  classicPlayerView: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    width: "100%",
-  },
+  classicPlayerView: { flex: 1, alignItems: "center", justifyContent: "center", width: "100%" },
   bigArt: { width: 300, height: 300, borderRadius: 12, marginBottom: 36 },
-  bigTitle: {
-    color: "#fff",
-    fontSize: 22,
-    fontWeight: "bold",
-    textAlign: "center",
-    width: "100%",
-    paddingHorizontal: 10,
-  },
-  bigArtist: {
-    color: "#888",
-    fontSize: 16,
-    marginTop: 6,
-    textAlign: "center",
-    width: "100%",
-  },
+  bigTitle: { color: "#fff", fontSize: 22, fontWeight: "bold", textAlign: "center", width: "100%", paddingHorizontal: 10 },
+  bigArtist: { color: "#888", fontSize: 16, marginTop: 6, textAlign: "center", width: "100%" },
 
-  queueContainerView: {
-    flex: 1,
-    width: "100%",
-    marginTop: 10,
-    marginBottom: 20,
-  },
-  queueHeaderLabel: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-    marginBottom: 12,
-    paddingLeft: 4,
-  },
+  queueContainerView: { flex: 1, width: "100%", marginTop: 10, marginBottom: 20 },
+  queueHeaderLabel: { color: "#fff", fontSize: 16, fontWeight: "bold", marginBottom: 12, paddingLeft: 4 },
   queueScrollView: { flex: 1, width: "100%" },
   queueCard: {
     flexDirection: "row",
@@ -824,18 +692,9 @@ const styles = StyleSheet.create({
 
   playerControlsDock: { width: "100%", paddingBottom: 20 },
   progressContainer: { width: "100%", marginBottom: 24 },
-  progressBarBg: {
-    height: 4,
-    backgroundColor: "#333",
-    borderRadius: 2,
-    width: "100%",
-  },
+  progressBarBg: { height: 4, backgroundColor: "#333", borderRadius: 2, width: "100%" },
   progressBarFill: { height: 4, backgroundColor: "#fff", borderRadius: 2 },
-  timeRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 8,
-  },
+  timeRow: { flexDirection: "row", justifyContent: "space-between", marginTop: 8 },
   timeText: { color: "#888", fontSize: 12 },
   controlsRow: {
     flexDirection: "row",
