@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   View,
   Text,
@@ -13,13 +13,7 @@ import {
   Keyboard,
   Animated,
 } from "react-native";
-import TrackPlayer, {
-  State,
-  Event,
-  Capability,
-  usePlaybackState,
-  useProgress,
-} from "react-native-track-player";
+import { WebView } from "react-native-webview";
 import {
   Play,
   Pause,
@@ -33,7 +27,6 @@ import {
   ListMusic,
   ArrowLeft,
   Flame,
-  Music,
 } from "lucide-react-native";
 
 const BACKEND_URL = "https://s-music-api-simplest-app.onrender.com";
@@ -41,16 +34,16 @@ const { width: SW } = Dimensions.get("window");
 
 // ── Accent palette ──────────────────────────────────────────────────
 const A = {
-  bg:       "#080810",
-  surface:  "#111118",
-  card:     "#15151f",
-  border:   "#1e1e2a",
-  accent:   "#4d8aff",
-  accent2:  "#63e6e0",
-  green:    "#1DB954",
-  text:     "#f0eef8",
-  dim:      "#8a8799",
-  faint:    "#3f3d4d",
+  bg:      "#080810",
+  surface: "#111118",
+  card:    "#15151f",
+  border:  "#1e1e2a",
+  accent:  "#4d8aff",
+  accent2: "#63e6e0",
+  green:   "#1DB954",
+  text:    "#f0eef8",
+  dim:     "#8a8799",
+  faint:   "#3f3d4d",
 };
 
 interface Track {
@@ -100,83 +93,177 @@ function EqDot({ active }: { active: boolean }) {
   );
 }
 
-export default function App() {
-  const playbackState = usePlaybackState();
-  const progress = useProgress();
+// ── Hidden YouTube WebView player ───────────────────────────────────
+// Loads a YouTube embed in a 1×1 invisible WebView.
+// JS injected into the page controls play/pause/seek via the YT IFrame API.
+// onMessage receives events: { type: "STATE", playing, duration, position }
+interface YTPlayerProps {
+  videoId: string | null;
+  playing: boolean;
+  onStateChange: (playing: boolean) => void;
+  onProgress: (position: number, duration: number) => void;
+  onEnded: () => void;
+  seekTo?: number | null;
+}
 
-  const [trendingTracks, setTrendingTracks]   = useState<Track[]>([]);
-  const [searchResults, setSearchResults]     = useState<Track[]>([]);
-  const [queueTracks, setQueueTracks]         = useState<Track[]>([]);
-  const [currentTrack, setCurrentTrack]       = useState<Track | null>(null);
-  const [isTrackLoading, setIsTrackLoading]   = useState<boolean>(false);
-  const [isSearchLoading, setIsSearchLoading] = useState<boolean>(false);
-  const [isShuffleEnabled, setIsShuffleEnabled] = useState<boolean>(false);
-  const [searchQuery, setSearchQuery]         = useState<string>("");
-  const [isSearchFocused, setIsSearchFocused] = useState<boolean>(false);
-  const [likedSongs, setLikedSongs]           = useState<string[]>([]);
-  const [isPlayerModalOpen, setIsPlayerModalOpen] = useState<boolean>(false);
-  const [isQueueVisible, setIsQueueVisible]   = useState<boolean>(false);
+function YTPlayer({ videoId, playing, onStateChange, onProgress, onEnded, seekTo }: YTPlayerProps) {
+  const webRef = useRef<WebView>(null);
+  const lastSeek = useRef<number | null>(null);
 
-  const isPlaying = playbackState.state === State.Playing;
-
-  // ── Setup ──────────────────────────────────────────────────────────
+  // When seekTo changes, send a seek command
   useEffect(() => {
-    async function setupPlayer() {
-      try {
-        await TrackPlayer.setupPlayer({});
-        await TrackPlayer.updateOptions({
-          capabilities: [
-            Capability.Play, Capability.Pause,
-            Capability.SkipToNext, Capability.SkipToPrevious,
-          ],
-          compactCapabilities: [
-            Capability.Play, Capability.Pause, Capability.SkipToNext,
-          ],
-        });
-      } catch (e) { console.log("Player initialized:", e); }
+    if (seekTo !== null && seekTo !== undefined && seekTo !== lastSeek.current) {
+      lastSeek.current = seekTo;
+      webRef.current?.injectJavaScript(`
+        if(window.player && window.player.seekTo) { window.player.seekTo(${seekTo}, true); } true;
+      `);
     }
-    setupPlayer();
-    loadTrendingCharts();
-  }, []);
+  }, [seekTo]);
 
+  // Play / pause commands
   useEffect(() => {
-    const playListener  = TrackPlayer.addEventListener(Event.RemotePlay, () => TrackPlayer.play());
-    const pauseListener = TrackPlayer.addEventListener(Event.RemotePause, () => TrackPlayer.pause());
-    const nextListener  = TrackPlayer.addEventListener(Event.RemoteNext, () => handleSkip("next"));
-    const prevListener  = TrackPlayer.addEventListener(Event.RemotePrevious, () => handleSkip("prev"));
-    return () => { playListener.remove(); pauseListener.remove(); nextListener.remove(); prevListener.remove(); };
-  }, [queueTracks, currentTrack, isShuffleEnabled]);
+    if (!videoId) return;
+    const cmd = playing
+      ? `if(window.player && window.player.playVideo) { window.player.playVideo(); } true;`
+      : `if(window.player && window.player.pauseVideo) { window.player.pauseVideo(); } true;`;
+    webRef.current?.injectJavaScript(cmd);
+  }, [playing]);
 
-  useEffect(() => {
-    const trackChangedListener = TrackPlayer.addEventListener(
-      Event.PlaybackActiveTrackChanged,
-      async (evt) => {
-        if (evt.track) {
-          const t = evt.track as any;
-          setCurrentTrack({ id: t.id, title: t.title, artist: t.artist, art: t.artwork, durationSec: t.duration, streamUrl: t.url });
-        }
+  if (!videoId) return null;
+
+  // The HTML loads YouTube IFrame API, auto-plays the video (audio only embed),
+  // and sends progress + state events back to React Native every second.
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin:0; background:#000; overflow:hidden; }
+  #player { width:1px; height:1px; position:absolute; top:-9999px; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+<script>
+  var tag = document.createElement('script');
+  tag.src = "https://www.youtube.com/iframe_api";
+  document.head.appendChild(tag);
+
+  var player;
+  var progressInterval;
+
+  function onYouTubeIframeAPIReady() {
+    player = new YT.Player('player', {
+      videoId: '${videoId}',
+      playerVars: {
+        autoplay: 1,
+        controls: 0,
+        playsinline: 1,
+        rel: 0,
+        modestbranding: 1,
+        iv_load_policy: 3,
       },
-    );
-    return () => trackChangedListener.remove();
-  }, []);
+      events: {
+        onReady: function(e) {
+          e.target.playVideo();
+          startProgress();
+        },
+        onStateChange: function(e) {
+          // YT states: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+          if (e.data === 0) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'ENDED' }));
+          } else if (e.data === 1) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'STATE', playing: true }));
+          } else if (e.data === 2) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'STATE', playing: false }));
+          }
+        },
+        onError: function(e) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'ERROR', code: e.data }));
+        }
+      }
+    });
+  }
 
-  // ── Data & playback logic (unchanged) ─────────────────────────────
+  function startProgress() {
+    clearInterval(progressInterval);
+    progressInterval = setInterval(function() {
+      if (player && player.getCurrentTime) {
+        var pos = player.getCurrentTime() || 0;
+        var dur = player.getDuration() || 0;
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'PROGRESS', position: pos, duration: dur
+        }));
+      }
+    }, 1000);
+  }
+
+  window.player = player;
+</script>
+</body>
+</html>
+  `;
+
+  return (
+    <WebView
+      ref={webRef}
+      source={{ html }}
+      style={{ width: 1, height: 1, position: "absolute", top: -9999, opacity: 0 }}
+      allowsInlineMediaPlayback
+      mediaPlaybackRequiresUserAction={false}
+      javaScriptEnabled
+      onMessage={(event: any) => {
+        try {
+          const msg = JSON.parse(event.nativeEvent.data);
+          if (msg.type === "STATE") onStateChange(msg.playing);
+          if (msg.type === "PROGRESS") onProgress(msg.position, msg.duration);
+          if (msg.type === "ENDED") onEnded();
+        } catch {}
+      }}
+    />
+  );
+}
+
+// ── Main App ────────────────────────────────────────────────────────
+export default function App() {
+  const [trendingTracks, setTrendingTracks]     = useState<Track[]>([]);
+  const [searchResults, setSearchResults]       = useState<Track[]>([]);
+  const [queueTracks, setQueueTracks]           = useState<Track[]>([]);
+  const [currentTrack, setCurrentTrack]         = useState<Track | null>(null);
+  const [isTrackLoading, setIsTrackLoading]     = useState(false);
+  const [isSearchLoading, setIsSearchLoading]   = useState(false);
+  const [isShuffleEnabled, setIsShuffleEnabled] = useState(false);
+  const [searchQuery, setSearchQuery]           = useState("");
+  const [isSearchFocused, setIsSearchFocused]   = useState(false);
+  const [likedSongs, setLikedSongs]             = useState<string[]>([]);
+  const [isPlayerModalOpen, setIsPlayerModalOpen] = useState(false);
+  const [isQueueVisible, setIsQueueVisible]     = useState(false);
+
+  // ── WebView player state ──────────────────────────────────────────
+  const [isPlaying, setIsPlaying]       = useState(false);
+  const [position, setPosition]         = useState(0);
+  const [duration, setDuration]         = useState(0);
+  const [seekTo, setSeekTo]             = useState<number | null>(null);
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
+
+  const pct = duration > 0 ? Math.min(1, position / duration) : 0;
+
+  // ── Load trending on mount ────────────────────────────────────────
+  useEffect(() => { loadTrendingCharts(); }, []);
+
   const loadTrendingCharts = async () => {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
       const response = await fetch(`${BACKEND_URL}/api/popular`, { signal: controller.signal });
       clearTimeout(timeoutId);
       const data = await response.json();
       if (response.ok && data.tracks && Array.isArray(data.tracks)) {
         setTrendingTracks(data.tracks);
-      } else {
-        console.log("Failed loading trending:", data.detail || response.statusText);
       }
-    } catch (err: any) { 
-      if (err.name !== 'AbortError') {
-        console.log("Failed loading dashboard popular chart items:", err);
-      }
+    } catch (err: any) {
+      if (err.name !== "AbortError") console.log("Failed loading trending:", err);
     }
   };
 
@@ -185,7 +272,7 @@ export default function App() {
     setIsSearchLoading(true);
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
       const response = await fetch(
         `${BACKEND_URL}/api/search/instant?q=${encodeURIComponent(searchQuery)}`,
         { signal: controller.signal }
@@ -193,70 +280,65 @@ export default function App() {
       clearTimeout(timeoutId);
       const data = await response.json();
       if (!response.ok) { alert(`Search failed: ${data.detail || response.statusText}`); return; }
-      if (!data.tracks || !Array.isArray(data.tracks)) { alert("No tracks found matching your entry."); return; }
-      if (data.tracks.length === 0) { alert("No tracks found matching your entry."); return; }
+      if (!data.tracks || !Array.isArray(data.tracks) || data.tracks.length === 0) {
+        alert("No tracks found. Try a different search term."); return;
+      }
       setSearchResults(data.tracks);
-    } catch (error: any) { 
-      if (error.name === 'AbortError') { alert("Search timed out. Try again."); }
-      else { console.error("Search error:", error); alert("Connection error. Please try again."); }
-    }
-    finally { setIsSearchLoading(false); }
+    } catch (error: any) {
+      if (error.name === "AbortError") alert("Search timed out. Try again.");
+      else alert("Connection error. Please try again.");
+    } finally { setIsSearchLoading(false); }
   };
 
+  // ── Play a track: just set the video ID — WebView handles the rest ─
   const playSingleTrack = async (track: Track) => {
     setIsTrackLoading(true);
     try {
-      let activeStreamUrl = track.streamUrl;
-      if (!activeStreamUrl || activeStreamUrl.includes("youtube.com/watch")) {
-        const res  = await fetch(`${BACKEND_URL}/api/tracks/resolve?video_id=${track.id}`);
-        const data = await res.json();
-        if (data.streamUrl) { activeStreamUrl = data.streamUrl; track.streamUrl = data.streamUrl; }
-        else { alert("Could not resolve streaming link for this track."); setIsTrackLoading(false); return; }
-      }
-      await TrackPlayer.reset();
-      await TrackPlayer.add({ id: track.id, url: activeStreamUrl ?? "", title: track.title, artist: track.artist, artwork: track.art, duration: track.durationSec } as any);
       setCurrentTrack(track);
-      await TrackPlayer.play();
+      setActiveVideoId(track.id);
+      setIsPlaying(true);
+      setPosition(0);
+      setDuration(track.durationSec || 0);
+
+      // Load related songs into queue in background
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
       fetch(`${BACKEND_URL}/api/search/queue?video_id=${track.id}`, { signal: controller.signal })
         .then(r => r.json())
-        .then(async queueData => {
+        .then(queueData => {
           clearTimeout(timeoutId);
           if (queueData.tracks && Array.isArray(queueData.tracks)) {
             setQueueTracks(queueData.tracks);
-            await TrackPlayer.add(queueData.tracks.map((t: Track) => ({ id: t.id, url: t.streamUrl ?? "", title: t.title, artist: t.artist, artwork: t.art, duration: t.durationSec })) as any);
           }
         })
-        .catch(err => {
-          clearTimeout(timeoutId);
-          console.log("Contextual background queueing failed:", err);
-        });
-    } catch (err) { console.error("Playback execution failed:", err); }
-    finally { setIsTrackLoading(false); }
-  };
-
-  const togglePlayPause = async () => { if (isPlaying) await TrackPlayer.pause(); else await TrackPlayer.play(); };
-
-  const handleSkip = async (direction: "next" | "prev") => {
-    if (queueTracks.length === 0 && !currentTrack) return;
-    const fullCurrentPlaylist = currentTrack ? [currentTrack, ...queueTracks] : queueTracks;
-    const currentIndex = fullCurrentPlaylist.findIndex(s => s.id === currentTrack?.id);
-    if (currentIndex === -1) return;
-    let nextIndex = direction === "next" ? currentIndex + 1 : currentIndex - 1;
-    if (isShuffleEnabled && direction === "next" && fullCurrentPlaylist.length > 1) {
-      let r = currentIndex;
-      while (r === currentIndex) r = Math.floor(Math.random() * fullCurrentPlaylist.length);
-      nextIndex = r;
+        .catch(() => clearTimeout(timeoutId));
+    } catch (err) {
+      console.error("Playback failed:", err);
+    } finally {
+      setIsTrackLoading(false);
     }
-    if (nextIndex >= fullCurrentPlaylist.length) nextIndex = 0;
-    if (nextIndex < 0) nextIndex = fullCurrentPlaylist.length - 1;
-    await playSingleTrack(fullCurrentPlaylist[nextIndex]);
   };
 
-  const toggleLike = (id: string) => {
-    setLikedSongs(prev => prev.includes(id) ? prev.filter(sid => sid !== id) : [...prev, id]);
-  };
+  const togglePlayPause = () => setIsPlaying(prev => !prev);
+
+  const handleSkip = useCallback((direction: "next" | "prev") => {
+    if (!currentTrack) return;
+    const playlist = [currentTrack, ...queueTracks];
+    const idx = playlist.findIndex(s => s.id === currentTrack.id);
+    if (idx === -1) return;
+    let next = direction === "next" ? idx + 1 : idx - 1;
+    if (isShuffleEnabled && direction === "next" && playlist.length > 1) {
+      let r = idx;
+      while (r === idx) r = Math.floor(Math.random() * playlist.length);
+      next = r;
+    }
+    if (next >= playlist.length) next = 0;
+    if (next < 0) next = playlist.length - 1;
+    playSingleTrack(playlist[next]);
+  }, [currentTrack, queueTracks, isShuffleEnabled]);
+
+  const toggleLike = (id: string) =>
+    setLikedSongs(prev => prev.includes(id) ? prev.filter(s => s !== id) : [...prev, id]);
 
   const cancelSearchFocus = () => {
     setIsSearchFocused(false);
@@ -265,14 +347,22 @@ export default function App() {
     Keyboard.dismiss();
   };
 
-  // ── Progress pct helper ────────────────────────────────────────────
-  const pct = currentTrack ? Math.min(1, progress.position / (currentTrack.durationSec || 1)) : 0;
-
-  // ── Render ─────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────
   return (
     <View style={st.shell}>
 
-      {/* ── HEADER ─────────────────────────────────────────────────── */}
+      {/* ── HIDDEN YOUTUBE WEBVIEW PLAYER ──────────────────────────── */}
+      {/* Invisible 1×1 WebView that plays audio from YouTube IFrame API */}
+      <YTPlayer
+        videoId={activeVideoId}
+        playing={isPlaying}
+        onStateChange={setIsPlaying}
+        onProgress={(pos, dur) => { setPosition(pos); if (dur > 0) setDuration(dur); }}
+        onEnded={() => handleSkip("next")}
+        seekTo={seekTo}
+      />
+
+      {/* ── HEADER ──────────────────────────────────────────────────── */}
       <View style={[st.header, isSearchFocused && st.headerFocused]}>
         {!isSearchFocused ? (
           <View style={st.headerTop}>
@@ -288,7 +378,6 @@ export default function App() {
           </Pressable>
         )}
 
-        {/* ── SEARCH BAR (bug fix: no flex:1 in column parent) ─────── */}
         <View style={[st.searchBar, isSearchFocused && st.searchBarFocused]}>
           <Search size={17} color={isSearchFocused ? A.accent : A.dim} />
           <TextInput
@@ -311,21 +400,20 @@ export default function App() {
         </View>
       </View>
 
-      {/* ── TRACK LOADING BAR ──────────────────────────────────────── */}
+      {/* ── TRACK LOADING BAR ───────────────────────────────────────── */}
       {isTrackLoading && (
         <View style={st.loadingBar}>
           <ActivityIndicator size="small" color={A.accent} />
-          <Text style={st.loadingText}>Resolving audio stream…</Text>
+          <Text style={st.loadingText}>Loading track…</Text>
         </View>
       )}
 
-      {/* ── MAIN CONTENT ───────────────────────────────────────────── */}
+      {/* ── MAIN CONTENT ────────────────────────────────────────────── */}
       {!isSearchFocused ? (
         <ScrollView
           contentContainerStyle={[st.scrollContent, currentTrack && { paddingBottom: 140 }]}
           showsVerticalScrollIndicator={false}
         >
-          {/* Section header */}
           <View style={st.sectionRow}>
             <View style={st.sectionIconWrap}><Flame size={16} color="#ff6b6b" /></View>
             <Text style={st.sectionTitle}>Trending Global Hits</Text>
@@ -346,30 +434,19 @@ export default function App() {
                 style={[st.songCard, isCurrent && st.songCardActive]}
                 onPress={() => playSingleTrack(song)}
               >
-                {/* Rank number */}
                 <Text style={[st.rankNum, isCurrent && { color: A.accent }]}>
                   {String(index + 1).padStart(2, "0")}
                 </Text>
-
-                {/* Art */}
                 <View style={st.artWrap}>
                   <Image source={{ uri: song.art }} style={st.songArt} />
-                  {isCurrent && (
-                    <View style={st.artOverlay}>
-                      <EqDot active={isPlaying} />
-                    </View>
-                  )}
+                  {isCurrent && <View style={st.artOverlay}><EqDot active={isPlaying} /></View>}
                 </View>
-
-                {/* Info */}
                 <View style={{ flex: 1, marginLeft: 12 }}>
                   <Text style={[st.songTitle, isCurrent && { color: A.accent }]} numberOfLines={1}>
                     {song.title}
                   </Text>
                   <Text style={st.songArtist} numberOfLines={1}>{song.artist}</Text>
                 </View>
-
-                {/* Like + play */}
                 <Pressable onPress={() => toggleLike(song.id)} hitSlop={8} style={{ marginRight: 10 }}>
                   <Heart
                     size={16}
@@ -387,25 +464,21 @@ export default function App() {
         </ScrollView>
 
       ) : (
-        /* ── SEARCH RESULTS ──────────────────────────────────────── */
         <ScrollView
           contentContainerStyle={[st.scrollContent, currentTrack && { paddingBottom: 140 }]}
           showsVerticalScrollIndicator={false}
         >
-          {isSearchLoading ? (
+          {searchResults.length === 0 ? (
             <View style={st.centeredBlock}>
-              <ActivityIndicator size="large" color={A.accent} />
-              <Text style={[st.hintText, { marginTop: 12 }]}>Searching…</Text>
-            </View>
-          ) : searchResults.length === 0 ? (
-            <View style={st.centeredBlock}>
-              <View style={st.emptyIconWrap}><Music size={32} color={A.faint} /></View>
+              <View style={st.emptyIconWrap}>
+                <Search size={28} color={A.dim} />
+              </View>
               <Text style={st.emptyTitle}>What do you want to hear?</Text>
               <Text style={st.hintText}>Type a song title or artist name{"\n"}and press enter to search.</Text>
             </View>
           ) : (
             <>
-              <Text style={st.resultsLabel}>{searchResults.length} results</Text>
+              <Text style={st.resultsLabel}>{searchResults.length} Results</Text>
               {searchResults.map((song, index) => {
                 const isCurrent = currentTrack?.id === song.id;
                 return (
@@ -416,9 +489,7 @@ export default function App() {
                   >
                     <View style={st.artWrap}>
                       <Image source={{ uri: song.art }} style={st.songArt} />
-                      {isCurrent && (
-                        <View style={st.artOverlay}><EqDot active={isPlaying} /></View>
-                      )}
+                      {isCurrent && <View style={st.artOverlay}><EqDot active={isPlaying} /></View>}
                     </View>
                     <View style={{ flex: 1, marginLeft: 12 }}>
                       <Text style={[st.songTitle, isCurrent && { color: A.accent }]} numberOfLines={1}>
@@ -445,17 +516,15 @@ export default function App() {
         </ScrollView>
       )}
 
-      {/* ── MINI PLAYER ────────────────────────────────────────────── */}
+      {/* ── MINI PLAYER ─────────────────────────────────────────────── */}
       {currentTrack && (
         <Pressable
           style={st.mini}
           onPress={() => { setIsPlayerModalOpen(true); setIsQueueVisible(false); }}
         >
-          {/* Thin progress line across top */}
           <View style={st.miniProgressTrack}>
             <View style={[st.miniProgressFill, { width: `${pct * 100}%` as any }]} />
           </View>
-
           <View style={st.miniInner}>
             <Image source={{ uri: currentTrack.art }} style={st.miniArt} />
             <View style={{ flex: 1, marginLeft: 10, marginRight: 8 }}>
@@ -467,7 +536,10 @@ export default function App() {
                 <SkipBack size={18} color={A.text} />
               </Pressable>
               <Pressable onPress={(e) => { e.stopPropagation(); togglePlayPause(); }} style={st.miniPlayBtn}>
-                {isPlaying ? <Pause size={18} color={A.bg} fill={A.bg} /> : <Play size={18} color={A.bg} fill={A.bg} />}
+                {isPlaying
+                  ? <Pause size={18} color={A.bg} fill={A.bg} />
+                  : <Play  size={18} color={A.bg} fill={A.bg} />
+                }
               </Pressable>
               <Pressable onPress={(e) => { e.stopPropagation(); handleSkip("next"); }} style={st.miniBtn}>
                 <SkipForward size={18} color={A.text} />
@@ -477,7 +549,7 @@ export default function App() {
         </Pressable>
       )}
 
-      {/* ── FULL PLAYER MODAL ──────────────────────────────────────── */}
+      {/* ── FULL PLAYER MODAL ───────────────────────────────────────── */}
       <Modal
         visible={isPlayerModalOpen}
         animationType="slide"
@@ -485,13 +557,11 @@ export default function App() {
         onRequestClose={() => setIsPlayerModalOpen(false)}
       >
         <View style={st.modal}>
-          {/* Background: blurred art tint */}
           {currentTrack && (
             <Image source={{ uri: currentTrack.art }} style={st.modalBgArt} blurRadius={28} />
           )}
           <View style={st.modalTint} />
 
-          {/* Modal header */}
           <View style={st.modalHeader}>
             <Pressable style={st.modalHeaderBtn} onPress={() => setIsPlayerModalOpen(false)}>
               <ChevronDown size={28} color={A.text} />
@@ -505,14 +575,10 @@ export default function App() {
           {currentTrack && (
             <View style={st.modalContent}>
               {!isQueueVisible ? (
-                /* ── Classic view ─── */
                 <View style={st.classicView}>
-                  {/* Album art */}
                   <View style={st.bigArtShadow}>
                     <Image source={{ uri: currentTrack.art }} style={st.bigArt} />
                   </View>
-
-                  {/* Title + like */}
                   <View style={st.bigMeta}>
                     <View style={{ flex: 1 }}>
                       <Text style={st.bigTitle} numberOfLines={1}>{currentTrack.title}</Text>
@@ -528,7 +594,6 @@ export default function App() {
                   </View>
                 </View>
               ) : (
-                /* ── Queue view ─── */
                 <View style={st.queueView}>
                   <Text style={st.queueHeader}>Up Next</Text>
                   <ScrollView showsVerticalScrollIndicator={false}>
@@ -550,22 +615,28 @@ export default function App() {
                 </View>
               )}
 
-              {/* ── Controls dock ─────────────────────────────── */}
+              {/* Controls dock */}
               <View style={st.dock}>
-                {/* Progress */}
+                {/* Progress bar — tap to seek */}
                 <View style={st.progressWrap}>
-                  <View style={st.progressTrack}>
+                  <Pressable
+                    style={st.progressTrack}
+                    onPress={(e) => {
+                      const tappedPct = e.nativeEvent.locationX / (SW - 48);
+                      setSeekTo(Math.floor(tappedPct * duration));
+                      setTimeout(() => setSeekTo(null), 500);
+                    }}
+                  >
                     <View style={[st.progressFill, { width: `${pct * 100}%` as any }]} />
-                    {/* Thumb dot */}
                     <View style={[st.progressThumb, { left: `${pct * 100}%` as any }]} />
-                  </View>
+                  </Pressable>
                   <View style={st.timeRow}>
-                    <Text style={st.timeText}>{formatTime(progress.position)}</Text>
-                    <Text style={st.timeText}>{formatTime(currentTrack.durationSec)}</Text>
+                    <Text style={st.timeText}>{formatTime(position)}</Text>
+                    <Text style={st.timeText}>{formatTime(duration)}</Text>
                   </View>
                 </View>
 
-                {/* Controls */}
+                {/* Playback controls */}
                 <View style={st.controls}>
                   <Pressable onPress={() => toggleLike(currentTrack.id)} hitSlop={10}>
                     <Heart
@@ -613,41 +684,24 @@ export default function App() {
 // ── StyleSheet ──────────────────────────────────────────────────────
 const st = StyleSheet.create({
   shell:  { flex: 1, backgroundColor: A.bg },
-
-  // Header
   header: {
-    paddingTop: 60,
-    paddingHorizontal: 18,
-    paddingBottom: 14,
-    backgroundColor: A.bg,
-    borderBottomWidth: 1,
-    borderBottomColor: A.border,
-    gap: 12,
+    paddingTop: 60, paddingHorizontal: 18, paddingBottom: 14,
+    backgroundColor: A.bg, borderBottomWidth: 1, borderBottomColor: A.border, gap: 12,
   },
   headerFocused: { flexDirection: "row", alignItems: "center", paddingTop: 56, gap: 10 },
   headerTop:  { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   headerEyebrow: { color: A.dim, fontSize: 11, textTransform: "uppercase", letterSpacing: 1.2 },
-  headerBrand: {
-    color: A.text, fontSize: 26, fontWeight: "800", letterSpacing: 0.5, marginTop: 2,
-  },
+  headerBrand: { color: A.text, fontSize: 26, fontWeight: "800", letterSpacing: 0.5, marginTop: 2 },
   headerAvatar: {
     width: 36, height: 36, borderRadius: 18,
     backgroundColor: A.accent, alignItems: "center", justifyContent: "center",
   },
   headerAvatarText: { color: A.bg, fontWeight: "800", fontSize: 14 },
   backBtn: { paddingRight: 4, paddingVertical: 6 },
-
-  // Search bar — KEY FIX: no flex:1 here so height:44 is respected in column parent
   searchBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "rgba(255,255,255,0.06)",
-    borderWidth: 1,
-    borderColor: A.border,
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    height: 46,
-    gap: 8,
+    flexDirection: "row", alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.06)", borderWidth: 1, borderColor: A.border,
+    borderRadius: 14, paddingHorizontal: 14, height: 46, gap: 8,
   },
   searchBarFocused: { flex: 1, borderColor: A.accent },
   searchInput: { flex: 1, color: A.text, fontSize: 14.5, padding: 0 },
@@ -655,19 +709,13 @@ const st = StyleSheet.create({
     width: 20, height: 20, borderRadius: 10,
     backgroundColor: A.faint, alignItems: "center", justifyContent: "center",
   },
-
-  // Loading bar
   loadingBar: {
     flexDirection: "row", alignItems: "center", justifyContent: "center",
     backgroundColor: "rgba(77,138,255,0.1)", paddingVertical: 7, gap: 8,
     borderBottomWidth: 1, borderBottomColor: "rgba(77,138,255,0.2)",
   },
   loadingText: { color: A.accent, fontSize: 12, fontWeight: "600" },
-
-  // Scroll
   scrollContent: { paddingHorizontal: 16, paddingTop: 20, paddingBottom: 110 },
-
-  // Section
   sectionRow: { flexDirection: "row", alignItems: "center", marginBottom: 16, gap: 8 },
   sectionIconWrap: {
     width: 28, height: 28, borderRadius: 8,
@@ -675,46 +723,27 @@ const st = StyleSheet.create({
   },
   sectionTitle: { color: A.text, fontSize: 17, fontWeight: "700" },
   resultsLabel: { color: A.dim, fontSize: 12, marginBottom: 12, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.8 },
-
-  // Song cards
   songCard: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: A.card,
-    padding: 10,
-    borderRadius: 12,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: A.border,
+    flexDirection: "row", alignItems: "center", backgroundColor: A.card,
+    padding: 10, borderRadius: 12, marginBottom: 8, borderWidth: 1, borderColor: A.border,
   },
-  songCardActive: {
-    backgroundColor: "rgba(77,138,255,0.1)",
-    borderColor: "rgba(77,138,255,0.3)",
-  },
+  songCardActive: { backgroundColor: "rgba(77,138,255,0.1)", borderColor: "rgba(77,138,255,0.3)" },
   rankNum: { color: A.faint, fontSize: 13, fontWeight: "700", width: 28, textAlign: "center" },
   artWrap: { position: "relative", width: 48, height: 48 },
   songArt: { width: 48, height: 48, borderRadius: 8, backgroundColor: A.surface },
   artOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(10,10,20,0.6)",
-    borderRadius: 8,
-    alignItems: "center",
-    justifyContent: "center",
+    ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(10,10,20,0.6)",
+    borderRadius: 8, alignItems: "center", justifyContent: "center",
   },
   songTitle:  { color: A.text, fontSize: 14.5, fontWeight: "600" },
   songArtist: { color: A.dim,  fontSize: 12.5, marginTop: 2 },
-
-  // Empty / centered
   centeredBlock:  { alignItems: "center", paddingTop: 80, paddingHorizontal: 40 },
   emptyIconWrap:  { width: 64, height: 64, borderRadius: 20, backgroundColor: A.card, alignItems: "center", justifyContent: "center", marginBottom: 16 },
   emptyTitle:     { color: A.text, fontSize: 16, fontWeight: "700", marginBottom: 6 },
   hintText:       { color: A.dim, fontSize: 13, textAlign: "center", lineHeight: 20 },
-
-  // Mini player
   mini: {
     position: "absolute", bottom: 0, left: 0, right: 0,
-    backgroundColor: "rgba(17,17,24,0.97)",
-    borderTopWidth: 1, borderTopColor: A.border,
+    backgroundColor: "rgba(17,17,24,0.97)", borderTopWidth: 1, borderTopColor: A.border,
   },
   miniProgressTrack: { height: 2, backgroundColor: A.border },
   miniProgressFill:  { height: 2, backgroundColor: A.accent },
@@ -731,13 +760,8 @@ const st = StyleSheet.create({
     width: 36, height: 36, borderRadius: 18,
     backgroundColor: A.text, alignItems: "center", justifyContent: "center",
   },
-
-  // Modal
   modal:      { flex: 1, backgroundColor: A.bg },
-  modalBgArt: {
-    ...StyleSheet.absoluteFillObject,
-    width: "100%", height: "100%", opacity: 0.25,
-  },
+  modalBgArt: { ...StyleSheet.absoluteFillObject, width: "100%", height: "100%", opacity: 0.25 },
   modalTint:  { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(8,8,16,0.75)" },
   modalHeader: {
     flexDirection: "row", alignItems: "center", justifyContent: "space-between",
@@ -746,52 +770,38 @@ const st = StyleSheet.create({
   modalHeaderBtn:   { padding: 14 },
   modalHeaderLabel: { color: A.text, fontSize: 13, fontWeight: "700", textTransform: "uppercase", letterSpacing: 1.5 },
   modalContent:     { flex: 1, paddingHorizontal: 24 },
-
-  // Classic player view
   classicView: { flex: 1, alignItems: "center", justifyContent: "center" },
   bigArtShadow: {
     shadowColor: "#000", shadowOpacity: 0.6, shadowRadius: 30,
-    shadowOffset: { width: 0, height: 14 }, elevation: 14,
-    borderRadius: 18, marginBottom: 32,
+    shadowOffset: { width: 0, height: 14 }, elevation: 14, borderRadius: 18, marginBottom: 32,
   },
-  bigArt:   { width: SW - 80, height: SW - 80, borderRadius: 18 },
-  bigMeta:  { flexDirection: "row", alignItems: "center", width: "100%", gap: 12 },
-  bigTitle: { color: A.text, fontSize: 22, fontWeight: "800" },
-  bigArtist:{ color: A.dim,  fontSize: 15, marginTop: 4 },
-
-  // Queue
+  bigArt:    { width: SW - 80, height: SW - 80, borderRadius: 18 },
+  bigMeta:   { flexDirection: "row", alignItems: "center", width: "100%", gap: 12 },
+  bigTitle:  { color: A.text, fontSize: 22, fontWeight: "800" },
+  bigArtist: { color: A.dim,  fontSize: 15, marginTop: 4 },
   queueView:   { flex: 1, paddingTop: 12 },
   queueHeader: { color: A.text, fontSize: 16, fontWeight: "700", marginBottom: 14 },
   queueCard: {
-    flexDirection: "row", alignItems: "center",
-    paddingVertical: 9, paddingHorizontal: 12,
-    backgroundColor: A.card, borderRadius: 10,
-    marginBottom: 8, borderWidth: 1, borderColor: A.border,
+    flexDirection: "row", alignItems: "center", paddingVertical: 9, paddingHorizontal: 12,
+    backgroundColor: A.card, borderRadius: 10, marginBottom: 8, borderWidth: 1, borderColor: A.border,
   },
   queueThumb:  { width: 40, height: 40, borderRadius: 8, backgroundColor: A.surface },
   queueTitle:  { color: A.text, fontSize: 14, fontWeight: "600" },
   queueArtist: { color: A.dim, fontSize: 12, marginTop: 2 },
-
-  // Controls dock
   dock: { width: "100%", paddingBottom: 28 },
   progressWrap: { marginBottom: 28 },
-  progressTrack: {
-    height: 4, backgroundColor: A.border, borderRadius: 2,
-    width: "100%", position: "relative",
-  },
+  progressTrack: { height: 4, backgroundColor: A.border, borderRadius: 2, width: "100%", position: "relative" },
   progressFill:  { height: 4, backgroundColor: A.accent, borderRadius: 2 },
   progressThumb: {
-    position: "absolute", top: -5,
-    width: 14, height: 14, borderRadius: 7,
+    position: "absolute", top: -5, width: 14, height: 14, borderRadius: 7,
     backgroundColor: A.text, marginLeft: -7,
     shadowColor: "#000", shadowOpacity: 0.4, shadowRadius: 4, shadowOffset: { width: 0, height: 2 },
   },
-  timeRow:   { flexDirection: "row", justifyContent: "space-between", marginTop: 8 },
-  timeText:  { color: A.dim, fontSize: 12 },
+  timeRow:  { flexDirection: "row", justifyContent: "space-between", marginTop: 8 },
+  timeText: { color: A.dim, fontSize: 12 },
   controls: {
-    flexDirection: "row", alignItems: "center",
-    justifyContent: "space-between", width: "100%", paddingHorizontal: 4,
-    marginBottom: 24,
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    width: "100%", paddingHorizontal: 4, marginBottom: 24,
   },
   bigPlayBtn: {
     width: 68, height: 68, borderRadius: 34,
